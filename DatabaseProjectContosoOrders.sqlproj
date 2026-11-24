@@ -13,6 +13,10 @@
   <ItemGroup>
     <PostDeploy Include="PostDeployment.sql" />
   </ItemGroup>
+  <ItemGroup>
+    <Build Remove="tests/**/*.sql" />
+    <None Include="tests/**/*.sql" />
+  </ItemGroup>
   <Target Name="BeforeBuild">
     <Delete Files="$(BaseIntermediateOutputPath)\project.assets.json" />
   </Target>
