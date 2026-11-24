@@ -9,11 +9,9 @@ on:
 permissions:
   contents: read
 
-# Serialize runs targeting main. Preserve queued runs.
 concurrency:
   group: contosoorders-${{ github.ref }}
   cancel-in-progress: false
-  queue: max
 
 jobs:
   # ==========================================================
@@ -107,11 +105,11 @@ jobs:
             -p 127.0.0.1:1433:1433 \
             mcr.microsoft.com/mssql/server:2022-latest
 
+      # 3-second connection timeout, 180 attempts.
       - name: Wait for SQL Server
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-
           Import-Module SqlServer
 
           $connection = "Server=localhost,1433;" +
@@ -181,7 +179,6 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-
           Import-Module SqlServer
 
           $connection = "Server=localhost,1433;" +
@@ -202,11 +199,10 @@ jobs:
       - name: Cleanup SQL container
         if: always()
         shell: bash
-        run: |
-          docker rm -f contoso-sql || true
+        run: docker rm -f contoso-sql || true
 
   # ==========================================================
-  # JOB 3: DEPLOYMENT PREVIEW AND DRIFT REPORT
+  # JOB 3: DEPLOYMENT PREVIEW AND DRIFT CAPTURE
   # ==========================================================
   preview:
     name: Capture Deployment Preview and Drift
@@ -259,7 +255,6 @@ jobs:
 
           echo "Target: $SQL_SERVER/$SQL_DATABASE"
 
-      # Subscription-aware login is required for ARM firewall commands.
       - name: Login to Azure with OIDC
         uses: azure/login@v3
         with:
@@ -345,7 +340,7 @@ jobs:
             "/p:ScriptDatabaseOptions=False"
           )
 
-          # Capture proposed schema changes.
+          # REQUIRED: proposed schema operations.
           & $sqlpackage /Action:DeployReport `
             @common `
             /OutputPath:preview/deployment-report.xml
@@ -354,7 +349,7 @@ jobs:
             throw "Deployment report generation failed."
           }
 
-          # Capture the proposed deployment SQL.
+          # REQUIRED: proposed deployment T-SQL.
           & $sqlpackage /Action:Script `
             @common `
             /OutputPath:preview/deployment-preview.sql
@@ -363,8 +358,16 @@ jobs:
             throw "Deployment script generation failed."
           }
 
-          # True DriftReport only works against a
-          # database with a DAC registration baseline.
+          # OPTIONAL: DAC registration drift report.
+          # A failure here must not fail the preview job.
+          #
+          # DriftReport may fail when the database lacks
+          # DAC registration or the identity lacks access.
+          #
+          # PowerShell's GitHub Actions wrapper checks the
+          # last native process exit code when the step ends.
+          # We explicitly reset it after handling the failure.
+
           $PSNativeCommandUseErrorActionPreference = $false
 
           & $sqlpackage /Action:DriftReport `
@@ -384,20 +387,27 @@ jobs:
             Remove-Item preview/drift-report.xml `
               -ErrorAction SilentlyContinue
 
-            "Drift report unavailable or failed. " +
+            "DriftReport unavailable (exit code $driftExitCode). " +
               "Check DAC registration and permissions." |
               Set-Content preview/drift-status.txt
 
             Write-Warning (
               "DriftReport unavailable. " +
-              "Deployment report is still available."
+              "Deployment report and script were generated."
             )
           }
+
+          # Clear the optional native command's failure code.
+          $global:LASTEXITCODE = 0
 
           "Commit: $env:GITHUB_SHA" |
             Set-Content preview/commit.txt
 
           Write-Host "Deployment preview complete."
+
+          # Required commands and file writes above must
+          # have succeeded to reach this point.
+          exit 0
 
       - name: Create preview checksums
         shell: bash
@@ -449,7 +459,7 @@ jobs:
 
     runs-on: ubuntu-latest
 
-    # Protected environment pauses for required reviewer.
+    # Required reviewers are configured in GitHub.
     environment: development
 
     permissions:
@@ -516,7 +526,6 @@ jobs:
           test "$SQL_DATABASE" = "ContosoOrders"
           test -n "$AZURE_SUBSCRIPTION_ID"
 
-      # Subscription-aware login for firewall management.
       - name: Login to Azure with OIDC
         uses: azure/login@v3
         with:
@@ -602,7 +611,7 @@ jobs:
             "/p:ScriptDatabaseOptions=False"
           )
 
-          # Generate fresh reports after approval.
+          # Generate a fresh deployment report after approval.
           & $sqlpackage /Action:DeployReport `
             @common `
             /OutputPath:fresh/deployment-report.xml
@@ -611,6 +620,7 @@ jobs:
             throw "Fresh deployment report failed."
           }
 
+          # Generate fresh proposed T-SQL after approval.
           & $sqlpackage /Action:Script `
             @common `
             /OutputPath:fresh/deployment-preview.sql
@@ -619,7 +629,7 @@ jobs:
             throw "Fresh deployment script failed."
           }
 
-          # Compare the fresh plan with the reviewed plan.
+          # Compare the new plan with the reviewed plan.
           $oldReport = Get-FileHash `
             preview/deployment-report.xml -Algorithm SHA256
 
@@ -642,7 +652,7 @@ jobs:
 
           Write-Host "Deployment plan matches approved preview."
 
-          # Publish the same DACPAC tested by CI.
+          # Publish the exact DACPAC that passed CI.
           & $sqlpackage /Action:Publish `
             @common
 
@@ -650,13 +660,12 @@ jobs:
             throw "Azure SQL deployment failed."
           }
 
-          Write-Host "Azure SQL DACPAC deployment completed."
+          Write-Host "Azure SQL deployment completed."
 
       - name: Verify database deployment
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-
           Import-Module SqlServer
 
           $token = az account get-access-token `
