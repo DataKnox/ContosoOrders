@@ -1,6 +1,6 @@
 CREATE TABLE [dbo].[Orders] (
     [OrderID]           INT            IDENTITY (1, 1) NOT NULL,
-    [CustomerNe]        NVARCHAR (100) NOT NULL,
+    [CustomerName]      NVARCHAR (100) NOT NULL,
     [RequestedShipDate] DATE           NULL,
     [OrderStatusID]     TINYINT        NOT NULL,
     CONSTRAINT [PK_Orders] PRIMARY KEY CLUSTERED ([OrderID] ASC),
