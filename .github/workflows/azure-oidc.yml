@@ -1,0 +1,60 @@
+name: Verify Azure OIDC
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-azure:
+    name: Verify Azure Authentication
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: development
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Login to Azure with OIDC
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Verify Azure subscription
+        shell: bash
+        run: |
+          az account show \
+            --query "{Name:name,Subscription:id,Tenant:tenantId}" \
+            --output table
+
+      - name: Verify SQL target configuration
+        shell: bash
+        env:
+          SQL_SERVER: ${{ vars.AZURE_SQL_SERVER }}
+          SQL_DATABASE: ${{ vars.AZURE_SQL_DATABASE }}
+        run: |
+          test "$SQL_SERVER" = "dp800knox.database.windows.net"
+          test "$SQL_DATABASE" = "ContosoOrders"
+
+          echo "Target server: $SQL_SERVER"
+          echo "Target database: $SQL_DATABASE"
+
+      - name: Verify Azure SQL token acquisition
+        shell: bash
+        run: |
+          az account get-access-token \
+            --resource https://database.windows.net/ \
+            --query accessToken \
+            --output tsv > /dev/null
+
+          echo "Azure SQL access token obtained."
+
+      - name: Logout
+        if: always()
+        shell: bash
+        run: az logout || true
