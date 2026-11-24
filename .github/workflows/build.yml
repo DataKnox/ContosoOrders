@@ -9,9 +9,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: contosoorders-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   # ==========================================================
-  # JOB 1: BUILD THE DATABASE PROJECT
+  # JOB 1: BUILD DACPAC
   # ==========================================================
   build:
     name: Build Database Project
@@ -27,7 +31,6 @@ jobs:
           dotnet-version: "10.0.404"
 
       - name: Build DACPAC
-        shell: bash
         run: |
           dotnet build DatabaseProjectContosoOrders.sqlproj \
             --configuration Release
@@ -41,7 +44,7 @@ jobs:
           retention-days: 7
 
   # ==========================================================
-  # JOB 2: TEST THE DATABASE
+  # JOB 2: TEST DATABASE
   # ==========================================================
   test:
     name: Test Database
@@ -81,7 +84,6 @@ jobs:
           set -euo pipefail
 
           PASSWORD="Test!$(openssl rand -hex 16)"
-
           echo "::add-mask::$PASSWORD"
           echo "TEST_SQL_PASSWORD=$PASSWORD" >> "$GITHUB_ENV"
 
@@ -93,13 +95,12 @@ jobs:
             -p 127.0.0.1:1433:1433 \
             mcr.microsoft.com/mssql/server:2022-latest
 
-      # Allow extra startup time for SQL Server in Docker.
-      # Do not retry PowerShell parameter binding errors.
+      # Corrected: 3-second connection timeout,
+      # 180 attempts, 2-second retry interval.
       - name: Wait for SQL Server
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-
           Import-Module SqlServer
 
           $connection = "Server=localhost,1433;" +
@@ -119,7 +120,6 @@ jobs:
                 -ErrorAction Stop | Out-Null
 
               $ready = $true
-
               Write-Host "SQL Server ready after $i attempts."
               break
             }
@@ -128,7 +128,7 @@ jobs:
             }
             catch {
               if ($i % 10 -eq 0) {
-                Write-Host "Waiting for SQL Server (attempt $i/180)..."
+                Write-Host "Waiting for SQL Server ($i/180)..."
               }
 
               if ($i -lt 180) {
@@ -139,10 +139,10 @@ jobs:
 
           if (-not $ready) {
             docker logs --tail 50 contoso-sql
-            throw "SQL Server did not become ready after 180 attempts."
+            throw "SQL Server did not become ready."
           }
 
-      - name: Deploy DACPAC to test database
+      - name: Publish DACPAC to test database
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -161,16 +161,13 @@ jobs:
             /p:BlockOnPossibleDataLoss=True
 
           if ($LASTEXITCODE -ne 0) {
-            throw "DACPAC test deployment failed."
+            throw "Test database deployment failed."
           }
 
-          Write-Host "DACPAC deployed to test database."
-
-      - name: Run automated SQL tests
+      - name: Run SQL smoke tests
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-
           Import-Module SqlServer
 
           $connection = "Server=localhost,1433;" +
@@ -182,43 +179,39 @@ jobs:
 
           Invoke-Sqlcmd `
             -ConnectionString $connection `
-            -InputFile "tests/smoke.sql" `
+            -InputFile tests/smoke.sql `
             -AbortOnError `
             -ErrorAction Stop
 
-          Write-Host "Database tests passed."
+          Write-Host "SQL smoke tests passed."
 
-      - name: Stop test database
+      - name: Cleanup test container
         if: always()
         shell: bash
-        run: |
-          docker rm -f contoso-sql || true
+        run: docker rm -f contoso-sql || true
 
   # ==========================================================
-  # JOB 3: DEPLOY TO AZURE SQL AFTER APPROVAL
+  # JOB 3: PREVIEW AND DRIFT CAPTURE
   # ==========================================================
-  deploy:
-    name: Deploy to Azure SQL
+  preview:
+    name: Capture Deployment Preview and Drift
     needs: [build, test]
 
-    # Pull requests build and test, but do not deploy.
-    # Deployment occurs only after a push to main.
     if: >-
       github.event_name == 'push' &&
       github.ref == 'refs/heads/main'
 
     runs-on: ubuntu-latest
-
-    # GitHub pauses here when required reviewers are configured.
-    environment: development
-
-    concurrency:
-      group: contosoorders-development
-      cancel-in-progress: false
+    environment: preview
 
     permissions:
       contents: read
       id-token: write
+
+    env:
+      SQL_SERVER: ${{ vars.AZURE_SQL_SERVER }}
+      SQL_DATABASE: ${{ vars.AZURE_SQL_DATABASE }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
     steps:
       - name: Setup .NET
@@ -226,26 +219,28 @@ jobs:
         with:
           dotnet-version: "10.0.404"
 
-      - name: Download validated DACPAC
+      - name: Download tested DACPAC
         uses: actions/download-artifact@v8
         with:
           name: ContosoOrders-DACPAC
           path: dacpac
 
-      - name: Install SQL tools
-        shell: pwsh
+      - name: Install SqlPackage
+        shell: bash
         run: |
-          dotnet tool install --global microsoft.sqlpackage `
+          dotnet tool install --global microsoft.sqlpackage \
             --version 170.5.96
 
-          Install-Module SqlServer `
-            -RequiredVersion 22.4.5.1 `
-            -Scope CurrentUser `
-            -Force `
-            -AllowClobber
+      - name: Verify SQL target
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      # The Entra application has database permissions,
-      # but does not need subscription-level Azure RBAC.
+          test "$SQL_SERVER" = "dp800knox.database.windows.net"
+          test "$SQL_DATABASE" = "ContosoOrders"
+          test -n "$AZURE_SUBSCRIPTION_ID"
+
+      # Corrected: no subscription ID passed to login.
       - name: Login to Azure with OIDC
         uses: azure/login@v3
         with:
@@ -253,30 +248,41 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           allow-no-subscriptions: true
 
-      - name: Verify deployment target
+      - name: Open temporary SQL firewall rule
         shell: bash
-        env:
-          SQL_SERVER: ${{ vars.AZURE_SQL_SERVER }}
-          SQL_DATABASE: ${{ vars.AZURE_SQL_DATABASE }}
         run: |
           set -euo pipefail
 
-          test "$SQL_SERVER" = \
-            "dp800knox.database.windows.net"
+          IP=$(curl --fail --silent --show-error \
+            --retry 3 https://api.ipify.org)
 
-          test "$SQL_DATABASE" = "ContosoOrders"
+          python3 -c \
+            'import ipaddress,sys; ipaddress.IPv4Address(sys.argv[1])' \
+            "$IP"
 
-          echo "Target verified: $SQL_SERVER/$SQL_DATABASE"
+          RULE="DP800-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-preview"
 
-      - name: Publish DACPAC to Azure SQL
+          echo "FIREWALL_RULE=$RULE" >> "$GITHUB_ENV"
+
+          az sql server firewall-rule create \
+            --subscription "$AZURE_SUBSCRIPTION_ID" \
+            --resource-group dp800 \
+            --server dp800knox \
+            --name "$RULE" \
+            --start-ip-address "$IP" \
+            --end-ip-address "$IP" \
+            --output none
+
+          echo "Temporary firewall rule created for $IP"
+
+      - name: Generate deployment and drift reports
         shell: pwsh
-        env:
-          SQL_SERVER: ${{ vars.AZURE_SQL_SERVER }}
-          SQL_DATABASE: ${{ vars.AZURE_SQL_DATABASE }}
         run: |
           $ErrorActionPreference = 'Stop'
 
-          # Obtain a token for Azure SQL, not Azure Resource Manager.
+          New-Item -ItemType Directory -Force preview |
+            Out-Null
+
           $token = az account get-access-token `
             --resource https://database.windows.net/ `
             --query accessToken `
@@ -295,14 +301,294 @@ jobs:
             "TrustServerCertificate=False;" +
             "Connection Timeout=30"
 
-          & "$HOME/.dotnet/tools/sqlpackage" `
-            /Action:Publish `
-            /SourceFile:dacpac/DatabaseProjectContosoOrders.dacpac `
+          $source = "dacpac/DatabaseProjectContosoOrders.dacpac"
+          $sqlpackage = "$HOME/.dotnet/tools/sqlpackage"
+
+          $common = @(
+            "/SourceFile:$source"
+            "/TargetConnectionString:$connection"
+            "/AccessToken:$token"
+            "/p:BlockOnPossibleDataLoss=True"
+            "/p:DropObjectsNotInSource=False"
+            "/p:ScriptDatabaseOptions=False"
+          )
+
+          # Capture proposed schema changes.
+          & $sqlpackage /Action:DeployReport `
+            @common `
+            /OutputPath:preview/deployment-report.xml
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Deployment report failed."
+          }
+
+          # Capture proposed T-SQL.
+          & $sqlpackage /Action:Script `
+            @common `
+            /OutputPath:preview/deployment-preview.sql
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Deployment script generation failed."
+          }
+
+          # DriftReport requires DAC registration.
+          # A missing report is recorded as unavailable.
+          $PSNativeCommandUseErrorActionPreference = $false
+
+          & $sqlpackage /Action:DriftReport `
             "/TargetConnectionString:$connection" `
             "/AccessToken:$token" `
-            /p:BlockOnPossibleDataLoss=True `
-            /p:DropObjectsNotInSource=False `
-            /p:ScriptDatabaseOptions=False
+            /OutputPath:preview/drift-report.xml
+
+          $driftExitCode = $LASTEXITCODE
+
+          if ($driftExitCode -eq 0) {
+            "DriftReport completed successfully." |
+              Set-Content preview/drift-status.txt
+          }
+          else {
+            Remove-Item preview/drift-report.xml `
+              -ErrorAction SilentlyContinue
+
+            "DriftReport unavailable or failed." |
+              Set-Content preview/drift-status.txt
+
+            Write-Warning (
+              "Drift report unavailable. " +
+              "Check DAC registration and permissions."
+            )
+          }
+
+          "Commit: $env:GITHUB_SHA" |
+            Set-Content preview/commit.txt
+
+      - name: Create preview checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sha256sum \
+            dacpac/DatabaseProjectContosoOrders.dacpac \
+            preview/deployment-report.xml \
+            preview/deployment-preview.sql \
+            > preview/checksums.sha256
+
+      - name: Upload deployment preview
+        uses: actions/upload-artifact@v7
+        with:
+          name: ContosoOrders-Deployment-Preview
+          path: preview/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove temporary firewall rule
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "${FIREWALL_RULE:-}" ]; then
+            az sql server firewall-rule delete \
+              --subscription "$AZURE_SUBSCRIPTION_ID" \
+              --resource-group dp800 \
+              --server dp800knox \
+              --name "$FIREWALL_RULE" \
+              --output none
+          fi
+
+      - name: Logout
+        if: always()
+        shell: bash
+        run: az logout || true
+
+  # ==========================================================
+  # JOB 4: APPROVE AND DEPLOY
+  # ==========================================================
+  deploy:
+    name: Deploy to Azure SQL
+    needs: [build, test, preview]
+
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main'
+
+    runs-on: ubuntu-latest
+
+    # Required reviewers are configured in GitHub.
+    environment: development
+
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      SQL_SERVER: ${{ vars.AZURE_SQL_SERVER }}
+      SQL_DATABASE: ${{ vars.AZURE_SQL_DATABASE }}
+      AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+    steps:
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: "10.0.404"
+
+      - name: Download tested DACPAC
+        uses: actions/download-artifact@v8
+        with:
+          name: ContosoOrders-DACPAC
+          path: dacpac
+
+      - name: Download reviewed preview
+        uses: actions/download-artifact@v8
+        with:
+          name: ContosoOrders-Deployment-Preview
+          path: preview
+
+      - name: Verify reviewed artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "$(cat preview/commit.txt)" = \
+            "Commit: $GITHUB_SHA"
+
+          sha256sum -c preview/checksums.sha256
+
+      - name: Install SQL tools
+        shell: pwsh
+        run: |
+          dotnet tool install --global microsoft.sqlpackage `
+            --version 170.5.96
+
+          Install-Module SqlServer `
+            -RequiredVersion 22.4.5.1 `
+            -Scope CurrentUser `
+            -Force `
+            -AllowClobber
+
+      - name: Verify SQL target
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test "$SQL_SERVER" = "dp800knox.database.windows.net"
+          test "$SQL_DATABASE" = "ContosoOrders"
+          test -n "$AZURE_SUBSCRIPTION_ID"
+
+      # Corrected: no subscription ID passed to login.
+      - name: Login to Azure with OIDC
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Open temporary SQL firewall rule
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IP=$(curl --fail --silent --show-error \
+            --retry 3 https://api.ipify.org)
+
+          python3 -c \
+            'import ipaddress,sys; ipaddress.IPv4Address(sys.argv[1])' \
+            "$IP"
+
+          RULE="DP800-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-deploy"
+
+          echo "FIREWALL_RULE=$RULE" >> "$GITHUB_ENV"
+
+          az sql server firewall-rule create \
+            --subscription "$AZURE_SUBSCRIPTION_ID" \
+            --resource-group dp800 \
+            --server dp800knox \
+            --name "$RULE" \
+            --start-ip-address "$IP" \
+            --end-ip-address "$IP" \
+            --output none
+
+          echo "Temporary firewall rule created for $IP"
+
+      - name: Recheck plan and publish
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          New-Item -ItemType Directory -Force fresh |
+            Out-Null
+
+          $token = az account get-access-token `
+            --resource https://database.windows.net/ `
+            --query accessToken `
+            --output tsv
+
+          if ($LASTEXITCODE -ne 0 -or
+              [string]::IsNullOrWhiteSpace($token)) {
+            throw "Could not obtain Azure SQL token."
+          }
+
+          Write-Host "::add-mask::$token"
+
+          $connection = "Server=tcp:$env:SQL_SERVER,1433;" +
+            "Database=$env:SQL_DATABASE;" +
+            "Encrypt=True;" +
+            "TrustServerCertificate=False;" +
+            "Connection Timeout=30"
+
+          $source = "dacpac/DatabaseProjectContosoOrders.dacpac"
+          $sqlpackage = "$HOME/.dotnet/tools/sqlpackage"
+
+          $common = @(
+            "/SourceFile:$source"
+            "/TargetConnectionString:$connection"
+            "/AccessToken:$token"
+            "/p:BlockOnPossibleDataLoss=True"
+            "/p:DropObjectsNotInSource=False"
+            "/p:ScriptDatabaseOptions=False"
+          )
+
+          # Generate a fresh deployment plan.
+          & $sqlpackage /Action:DeployReport `
+            @common `
+            /OutputPath:fresh/deployment-report.xml
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Fresh deployment report failed."
+          }
+
+          & $sqlpackage /Action:Script `
+            @common `
+            /OutputPath:fresh/deployment-preview.sql
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Fresh deployment script failed."
+          }
+
+          # Compare to the plan reviewed before approval.
+          $oldReport = Get-FileHash `
+            preview/deployment-report.xml -Algorithm SHA256
+
+          $newReport = Get-FileHash `
+            fresh/deployment-report.xml -Algorithm SHA256
+
+          $oldScript = Get-FileHash `
+            preview/deployment-preview.sql -Algorithm SHA256
+
+          $newScript = Get-FileHash `
+            fresh/deployment-preview.sql -Algorithm SHA256
+
+          if ($oldReport.Hash -ne $newReport.Hash -or
+              $oldScript.Hash -ne $newScript.Hash) {
+            throw (
+              "Deployment plan changed since approval. " +
+              "A new review is required."
+            )
+          }
+
+          Write-Host "Reviewed deployment plan matches."
+
+          # Deploy the DACPAC that passed CI.
+          & $sqlpackage /Action:Publish `
+            @common
 
           if ($LASTEXITCODE -ne 0) {
             throw "Azure SQL deployment failed."
@@ -312,12 +598,8 @@ jobs:
 
       - name: Verify database deployment
         shell: pwsh
-        env:
-          SQL_SERVER: ${{ vars.AZURE_SQL_SERVER }}
-          SQL_DATABASE: ${{ vars.AZURE_SQL_DATABASE }}
         run: |
           $ErrorActionPreference = 'Stop'
-
           Import-Module SqlServer
 
           $token = az account get-access-token `
@@ -340,7 +622,7 @@ jobs:
               THROW 51011, 'OrderStatus table missing.', 1;
 
           IF OBJECT_ID('dbo.usp_GetOrders', 'P') IS NULL
-              THROW 51012, 'GetOrders procedure missing.', 1;
+              THROW 51012, 'Procedure missing.', 1;
 
           IF (
               SELECT COUNT(*)
@@ -351,7 +633,7 @@ jobs:
           ) <> 3
               THROW 51013, 'Reference data missing.', 1;
 
-          SELECT 'Deployment verification passed' AS Result;
+          SELECT 'Deployment verified' AS Result;
           '@
 
           Invoke-Sqlcmd `
@@ -364,10 +646,22 @@ jobs:
             -AbortOnError `
             -ErrorAction Stop
 
-          Write-Host "Azure SQL deployment verified."
+          Write-Host "Database deployment verified."
 
-      - name: Logout of Azure
+      - name: Remove temporary firewall rule
         if: always()
         shell: bash
         run: |
-          az logout || true
+          if [ -n "${FIREWALL_RULE:-}" ]; then
+            az sql server firewall-rule delete \
+              --subscription "$AZURE_SUBSCRIPTION_ID" \
+              --resource-group dp800 \
+              --server dp800knox \
+              --name "$FIREWALL_RULE" \
+              --output none
+          fi
+
+      - name: Logout
+        if: always()
+        shell: bash
+        run: az logout || true
