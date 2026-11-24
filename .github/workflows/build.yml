@@ -95,7 +95,7 @@ jobs:
             "Database=master;" +
             "User ID=sa;" +
             "Password=$env:TEST_SQL_PASSWORD;" +
-            "Encrypt=True;TrustServerCertificate=True"
+            "Encrypt=True;TrustServerCertificate=True;Connect Timeout=3"
 
           $ready = $false
 
@@ -104,11 +104,13 @@ jobs:
               Invoke-Sqlcmd `
                 -ConnectionString $connection `
                 -Query "SELECT 1" `
-                -ConnectionTimeout 3 `
-                -ErrorAction Stop | Out-Null
+                  -ErrorAction Stop | Out-Null
 
               $ready = $true
               break
+            }
+            catch [System.Management.Automation.ParameterBindingException] {
+              throw
             }
             catch {
               Start-Sleep -Seconds 2
