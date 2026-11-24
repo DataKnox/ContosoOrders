@@ -99,7 +99,7 @@ jobs:
 
           $ready = $false
 
-          for ($i = 0; $i -lt 60; $i++) {
+          for ($i = 0; $i -lt 180; $i++) {
             try {
               Invoke-Sqlcmd `
                 -ConnectionString $connection `
