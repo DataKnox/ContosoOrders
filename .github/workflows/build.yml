@@ -1,4 +1,4 @@
-name: ContosoOrders CI
+name: ContosoOrders CI/CD
 
 on:
   pull_request:
@@ -10,7 +10,9 @@ permissions:
   contents: read
 
 jobs:
-  # JOB 1: BUILD THE DACPAC
+  # ==========================================================
+  # JOB 1: BUILD THE DATABASE PROJECT
+  # ==========================================================
   build:
     name: Build Database Project
     runs-on: ubuntu-latest
@@ -25,6 +27,7 @@ jobs:
           dotnet-version: "10.0.404"
 
       - name: Build DACPAC
+        shell: bash
         run: |
           dotnet build DatabaseProjectContosoOrders.sqlproj \
             --configuration Release
@@ -37,7 +40,9 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # ==========================================================
   # JOB 2: TEST THE DATABASE
+  # ==========================================================
   test:
     name: Test Database
     needs: build
@@ -73,6 +78,8 @@ jobs:
       - name: Start SQL Server
         shell: bash
         run: |
+          set -euo pipefail
+
           PASSWORD="Test!$(openssl rand -hex 16)"
 
           echo "::add-mask::$PASSWORD"
@@ -86,84 +93,281 @@ jobs:
             -p 127.0.0.1:1433:1433 \
             mcr.microsoft.com/mssql/server:2022-latest
 
+      # Allow extra startup time for SQL Server in Docker.
+      # Do not retry PowerShell parameter binding errors.
       - name: Wait for SQL Server
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+
           Import-Module SqlServer
 
           $connection = "Server=localhost,1433;" +
             "Database=master;" +
             "User ID=sa;" +
             "Password=$env:TEST_SQL_PASSWORD;" +
-            "Encrypt=True;TrustServerCertificate=True;Connect Timeout=3"
+            "Encrypt=True;TrustServerCertificate=True;" +
+            "Connect Timeout=3"
 
           $ready = $false
 
-          for ($i = 0; $i -lt 180; $i++) {
+          for ($i = 1; $i -le 180; $i++) {
             try {
               Invoke-Sqlcmd `
                 -ConnectionString $connection `
                 -Query "SELECT 1" `
-                  -ErrorAction Stop | Out-Null
+                -ErrorAction Stop | Out-Null
 
               $ready = $true
+
+              Write-Host "SQL Server ready after $i attempts."
               break
             }
             catch [System.Management.Automation.ParameterBindingException] {
               throw
             }
             catch {
-              Start-Sleep -Seconds 2
+              if ($i % 10 -eq 0) {
+                Write-Host "Waiting for SQL Server (attempt $i/180)..."
+              }
+
+              if ($i -lt 180) {
+                Start-Sleep -Seconds 2
+              }
             }
           }
 
           if (-not $ready) {
-            throw "SQL Server did not become ready."
+            docker logs --tail 50 contoso-sql
+            throw "SQL Server did not become ready after 180 attempts."
           }
-
-          Write-Host "SQL Server is ready."
 
       - name: Deploy DACPAC to test database
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+
           $connection = "Server=localhost,1433;" +
             "Database=ContosoOrdersTest;" +
             "User ID=sa;" +
             "Password=$env:TEST_SQL_PASSWORD;" +
-            "Encrypt=True;TrustServerCertificate=True"
+            "Encrypt=True;TrustServerCertificate=True;" +
+            "Connect Timeout=30"
 
-          sqlpackage `
+          & "$HOME/.dotnet/tools/sqlpackage" `
             /Action:Publish `
             /SourceFile:dacpac/DatabaseProjectContosoOrders.dacpac `
             "/TargetConnectionString:$connection" `
             /p:BlockOnPossibleDataLoss=True
 
           if ($LASTEXITCODE -ne 0) {
-            throw "DACPAC deployment failed."
+            throw "DACPAC test deployment failed."
           }
+
+          Write-Host "DACPAC deployed to test database."
 
       - name: Run automated SQL tests
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+
           Import-Module SqlServer
 
           $connection = "Server=localhost,1433;" +
             "Database=ContosoOrdersTest;" +
             "User ID=sa;" +
             "Password=$env:TEST_SQL_PASSWORD;" +
-            "Encrypt=True;TrustServerCertificate=True"
+            "Encrypt=True;TrustServerCertificate=True;" +
+            "Connect Timeout=30"
 
           Invoke-Sqlcmd `
             -ConnectionString $connection `
             -InputFile "tests/smoke.sql" `
             -AbortOnError `
-            -ErrorAction Stop `
-            -Verbose
+            -ErrorAction Stop
 
-          Write-Host "All database tests passed!"
+          Write-Host "Database tests passed."
 
       - name: Stop test database
         if: always()
         shell: bash
         run: |
           docker rm -f contoso-sql || true
+
+  # ==========================================================
+  # JOB 3: DEPLOY TO AZURE SQL AFTER APPROVAL
+  # ==========================================================
+  deploy:
+    name: Deploy to Azure SQL
+    needs: [build, test]
+
+    # Pull requests build and test, but do not deploy.
+    # Deployment occurs only after a push to main.
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main'
+
+    runs-on: ubuntu-latest
+
+    # GitHub pauses here when required reviewers are configured.
+    environment: development
+
+    concurrency:
+      group: contosoorders-development
+      cancel-in-progress: false
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: "10.0.404"
+
+      - name: Download validated DACPAC
+        uses: actions/download-artifact@v8
+        with:
+          name: ContosoOrders-DACPAC
+          path: dacpac
+
+      - name: Install SQL tools
+        shell: pwsh
+        run: |
+          dotnet tool install --global microsoft.sqlpackage `
+            --version 170.5.96
+
+          Install-Module SqlServer `
+            -RequiredVersion 22.4.5.1 `
+            -Scope CurrentUser `
+            -Force `
+            -AllowClobber
+
+      # The Entra application has database permissions,
+      # but does not need subscription-level Azure RBAC.
+      - name: Login to Azure with OIDC
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Verify deployment target
+        shell: bash
+        env:
+          SQL_SERVER: ${{ vars.AZURE_SQL_SERVER }}
+          SQL_DATABASE: ${{ vars.AZURE_SQL_DATABASE }}
+        run: |
+          set -euo pipefail
+
+          test "$SQL_SERVER" = \
+            "dp800knox.database.windows.net"
+
+          test "$SQL_DATABASE" = "ContosoOrders"
+
+          echo "Target verified: $SQL_SERVER/$SQL_DATABASE"
+
+      - name: Publish DACPAC to Azure SQL
+        shell: pwsh
+        env:
+          SQL_SERVER: ${{ vars.AZURE_SQL_SERVER }}
+          SQL_DATABASE: ${{ vars.AZURE_SQL_DATABASE }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # Obtain a token for Azure SQL, not Azure Resource Manager.
+          $token = az account get-access-token `
+            --resource https://database.windows.net/ `
+            --query accessToken `
+            --output tsv
+
+          if ($LASTEXITCODE -ne 0 -or
+              [string]::IsNullOrWhiteSpace($token)) {
+            throw "Could not obtain Azure SQL token."
+          }
+
+          Write-Host "::add-mask::$token"
+
+          $connection = "Server=tcp:$env:SQL_SERVER,1433;" +
+            "Database=$env:SQL_DATABASE;" +
+            "Encrypt=True;" +
+            "TrustServerCertificate=False;" +
+            "Connection Timeout=30"
+
+          & "$HOME/.dotnet/tools/sqlpackage" `
+            /Action:Publish `
+            /SourceFile:dacpac/DatabaseProjectContosoOrders.dacpac `
+            "/TargetConnectionString:$connection" `
+            "/AccessToken:$token" `
+            /p:BlockOnPossibleDataLoss=True `
+            /p:DropObjectsNotInSource=False `
+            /p:ScriptDatabaseOptions=False
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Azure SQL deployment failed."
+          }
+
+          Write-Host "Azure SQL deployment completed."
+
+      - name: Verify database deployment
+        shell: pwsh
+        env:
+          SQL_SERVER: ${{ vars.AZURE_SQL_SERVER }}
+          SQL_DATABASE: ${{ vars.AZURE_SQL_DATABASE }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Import-Module SqlServer
+
+          $token = az account get-access-token `
+            --resource https://database.windows.net/ `
+            --query accessToken `
+            --output tsv
+
+          if ($LASTEXITCODE -ne 0 -or
+              [string]::IsNullOrWhiteSpace($token)) {
+            throw "Could not obtain verification token."
+          }
+
+          Write-Host "::add-mask::$token"
+
+          $query = @'
+          IF OBJECT_ID('dbo.Orders', 'U') IS NULL
+              THROW 51010, 'Orders table missing.', 1;
+
+          IF OBJECT_ID('dbo.OrderStatus', 'U') IS NULL
+              THROW 51011, 'OrderStatus table missing.', 1;
+
+          IF OBJECT_ID('dbo.usp_GetOrders', 'P') IS NULL
+              THROW 51012, 'GetOrders procedure missing.', 1;
+
+          IF (
+              SELECT COUNT(*)
+              FROM dbo.OrderStatus
+              WHERE (OrderStatusID = 1 AND StatusName = 'Pending')
+                 OR (OrderStatusID = 2 AND StatusName = 'Shipped')
+                 OR (OrderStatusID = 3 AND StatusName = 'Cancelled')
+          ) <> 3
+              THROW 51013, 'Reference data missing.', 1;
+
+          SELECT 'Deployment verification passed' AS Result;
+          '@
+
+          Invoke-Sqlcmd `
+            -ServerInstance "tcp:$env:SQL_SERVER,1433" `
+            -Database $env:SQL_DATABASE `
+            -AccessToken $token `
+            -Encrypt Mandatory `
+            -TrustServerCertificate:$false `
+            -Query $query `
+            -AbortOnError `
+            -ErrorAction Stop
+
+          Write-Host "Azure SQL deployment verified."
+
+      - name: Logout of Azure
+        if: always()
+        shell: bash
+        run: |
+          az logout || true
